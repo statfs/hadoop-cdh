@@ -1,0 +1,439 @@
+From 042da8b868a212c843bcbf3594519dd26e816e79 Mon Sep 17 00:00:00 2001
+From: Daniel Templeton <daniel@cloudera.com>
+Date: Mon, 11 Jul 2016 22:34:15 -0700
+Subject: [PATCH 1601/1601] Revert "YARN-2958. Made RMStateStore not update
+ the last sequence number when updating the
+ delegation token. Contributed by Varun Saxena."
+
+This reverts commit 83065d45f8badce6b0df30789df8584b223e40cd.
+
+Change-Id: I698d93b90246af51a440d87d50f872dee6a0916f
+---
+ .../recovery/FileSystemRMStateStore.java           |   51 ++++++++++----------
+ .../recovery/MemoryRMStateStore.java               |   32 +++++-------
+ .../resourcemanager/recovery/NullRMStateStore.java |   12 ++---
+ .../resourcemanager/recovery/RMStateStore.java     |   30 +++++++-----
+ .../resourcemanager/recovery/ZKRMStateStore.java   |   40 ++++++++-------
+ .../security/RMDelegationTokenSecretManager.java   |   15 ++++--
+ .../recovery/RMStateStoreTestBase.java             |   14 +++---
+ 7 files changed, 102 insertions(+), 92 deletions(-)
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+index 192157c..1b6bf09 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/FileSystemRMStateStore.java
+@@ -439,10 +439,11 @@ public synchronized void removeApplicationStateInternal(
+   }
+ 
+   @Override
+-  public synchronized void storeRMDelegationTokenState(
+-      RMDelegationTokenIdentifier identifier, Long renewDate)
+-      throws Exception {
+-    storeOrUpdateRMDelegationTokenState(identifier, renewDate, false);
++  public synchronized void storeRMDelegationTokenAndSequenceNumberState(
++      RMDelegationTokenIdentifier identifier, Long renewDate,
++      int latestSequenceNumber) throws Exception {
++    storeOrUpdateRMDelegationTokenAndSequenceNumberState(
++        identifier, renewDate,latestSequenceNumber, false);
+   }
+ 
+   @Override
+@@ -455,15 +456,16 @@ public synchronized void removeRMDelegationTokenState(
+   }
+ 
+   @Override
+-  protected void updateRMDelegationTokenState(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+-      throws Exception {
+-    storeOrUpdateRMDelegationTokenState(rmDTIdentifier, renewDate, true);
++  protected void updateRMDelegationTokenAndSequenceNumberInternal(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) throws Exception {
++    storeOrUpdateRMDelegationTokenAndSequenceNumberState(
++        rmDTIdentifier, renewDate,latestSequenceNumber, true);
+   }
+ 
+-  private void storeOrUpdateRMDelegationTokenState(
++  private void storeOrUpdateRMDelegationTokenAndSequenceNumberState(
+       RMDelegationTokenIdentifier identifier, Long renewDate,
+-      boolean isUpdate) throws Exception {
++      int latestSequenceNumber, boolean isUpdate) throws Exception {
+     Path nodeCreatePath =
+         getNodePath(rmDTSecretManagerRoot,
+           DELEGATION_TOKEN_PREFIX + identifier.getSequenceNumber());
+@@ -480,23 +482,22 @@ private void storeOrUpdateRMDelegationTokenState(
+     }
+     fsOut.close();
+ 
+-      // store sequence number
+-      Path latestSequenceNumberPath = getNodePath(rmDTSecretManagerRoot,
+-            DELEGATION_TOKEN_SEQUENCE_NUMBER_PREFIX
+-            + identifier.getSequenceNumber());
+-      LOG.info("Storing " + DELEGATION_TOKEN_SEQUENCE_NUMBER_PREFIX
+-          + identifier.getSequenceNumber());
+-      if (dtSequenceNumberPath == null) {
+-        if (!createFile(latestSequenceNumberPath)) {
+-          throw new Exception("Failed to create " + latestSequenceNumberPath);
+-        }
+-      } else {
+-        if (!renameFile(dtSequenceNumberPath, latestSequenceNumberPath)) {
+-          throw new Exception("Failed to rename " + dtSequenceNumberPath);
+-        }
++    // store sequence number
++    Path latestSequenceNumberPath = getNodePath(rmDTSecretManagerRoot,
++          DELEGATION_TOKEN_SEQUENCE_NUMBER_PREFIX + latestSequenceNumber);
++    LOG.info("Storing " + DELEGATION_TOKEN_SEQUENCE_NUMBER_PREFIX
++        + latestSequenceNumber);
++    if (dtSequenceNumberPath == null) {
++      if (!createFile(latestSequenceNumberPath)) {
++        throw new Exception("Failed to create " + latestSequenceNumberPath);
++      }
++    } else {
++      if (!renameFile(dtSequenceNumberPath, latestSequenceNumberPath)) {
++        throw new Exception("Failed to rename " + dtSequenceNumberPath);
+       }
+-      dtSequenceNumberPath = latestSequenceNumberPath;
+     }
++    dtSequenceNumberPath = latestSequenceNumberPath;
++  }
+ 
+   @Override
+   public synchronized void storeRMDTMasterKeyState(DelegationKey masterKey)
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/MemoryRMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/MemoryRMStateStore.java
+index dda151d..b5ed260 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/MemoryRMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/MemoryRMStateStore.java
+@@ -149,30 +149,23 @@ public synchronized void removeApplicationStateInternal(
+     }
+   }
+ 
+-  private void storeOrUpdateRMDT(RMDelegationTokenIdentifier rmDTIdentifier,
+-      Long renewDate, boolean isUpdate) throws Exception {
++  @Override
++  public synchronized void storeRMDelegationTokenAndSequenceNumberState(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) throws Exception {
+     Map<RMDelegationTokenIdentifier, Long> rmDTState =
+         state.rmSecretManagerState.getTokenState();
+     if (rmDTState.containsKey(rmDTIdentifier)) {
+       IOException e = new IOException("RMDelegationToken: " + rmDTIdentifier
+-          + "is already stored.");
++              + "is already stored.");
+       LOG.info("Error storing info for RMDelegationToken: " + rmDTIdentifier, e);
+       throw e;
+     }
+     rmDTState.put(rmDTIdentifier, renewDate);
+-    if(!isUpdate) {
+-      state.rmSecretManagerState.dtSequenceNumber = 
+-          rmDTIdentifier.getSequenceNumber();
+-    }
++    state.rmSecretManagerState.dtSequenceNumber = latestSequenceNumber;
+     LOG.info("Store RMDT with sequence number "
+-             + rmDTIdentifier.getSequenceNumber());
+-  }
+-
+-  @Override
+-  public synchronized void storeRMDelegationTokenState(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+-      throws Exception {
+-    storeOrUpdateRMDT(rmDTIdentifier, renewDate, false);
++        + rmDTIdentifier.getSequenceNumber()
++        + ". And the latest sequence number is " + latestSequenceNumber);
+   }
+ 
+   @Override
+@@ -186,11 +179,12 @@ public synchronized void removeRMDelegationTokenState(
+   }
+ 
+   @Override
+-  protected void updateRMDelegationTokenState(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+-      throws Exception {
++  protected void updateRMDelegationTokenAndSequenceNumberInternal(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) throws Exception {
+     removeRMDelegationTokenState(rmDTIdentifier);
+-    storeOrUpdateRMDT(rmDTIdentifier, renewDate, true);
++    storeRMDelegationTokenAndSequenceNumberState(
++        rmDTIdentifier, renewDate, latestSequenceNumber);
+     LOG.info("Update RMDT with sequence number "
+         + rmDTIdentifier.getSequenceNumber());
+   }
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/NullRMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/NullRMStateStore.java
+index 92c07cd..4b7c837 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/NullRMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/NullRMStateStore.java
+@@ -77,9 +77,9 @@ protected void removeApplicationStateInternal(ApplicationStateData appState)
+   }
+ 
+   @Override
+-  public void storeRMDelegationTokenState(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+-      throws Exception {
++  public void storeRMDelegationTokenAndSequenceNumberState(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) throws Exception {
+     // Do nothing
+   }
+ 
+@@ -90,9 +90,9 @@ public void removeRMDelegationTokenState(RMDelegationTokenIdentifier rmDTIdentif
+   }
+ 
+   @Override
+-  protected void updateRMDelegationTokenState(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+-      throws Exception {
++  protected void updateRMDelegationTokenAndSequenceNumberInternal(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) throws Exception {
+     // Do nothing
+   }
+ 
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+index 00e4b06..fcbcdc2 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+@@ -492,10 +492,12 @@ protected abstract void updateApplicationAttemptStateInternal(
+    * RMDTSecretManager call this to store the state of a delegation token
+    * and sequence number
+    */
+-  public synchronized void storeRMDelegationToken(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate) {
++  public synchronized void storeRMDelegationTokenAndSequenceNumber(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) {
+     try {
+-      storeRMDelegationTokenState(rmDTIdentifier, renewDate);
++      storeRMDelegationTokenAndSequenceNumberState(rmDTIdentifier, renewDate,
++          latestSequenceNumber);
+     } catch (Exception e) {
+       notifyStoreOperationFailed(e);
+     }
+@@ -506,15 +508,15 @@ public synchronized void storeRMDelegationToken(
+    * Derived classes must implement this method to store the state of
+    * RMDelegationToken and sequence number
+    */
+-  protected abstract void storeRMDelegationTokenState(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+-      throws Exception;
++  protected abstract void storeRMDelegationTokenAndSequenceNumberState(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) throws Exception;
+ 
+   /**
+    * RMDTSecretManager call this to remove the state of a delegation token
+    */
+   public synchronized void removeRMDelegationToken(
+-      RMDelegationTokenIdentifier rmDTIdentifier) {
++      RMDelegationTokenIdentifier rmDTIdentifier, int sequenceNumber) {
+     try {
+       removeRMDelegationTokenState(rmDTIdentifier);
+     } catch (Exception e) {
+@@ -533,10 +535,12 @@ protected abstract void removeRMDelegationTokenState(
+    * RMDTSecretManager call this to update the state of a delegation token
+    * and sequence number
+    */
+-  public synchronized void updateRMDelegationToken(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate) {
++  public synchronized void updateRMDelegationTokenAndSequenceNumber(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) {
+     try {
+-      updateRMDelegationTokenState(rmDTIdentifier, renewDate);
++      updateRMDelegationTokenAndSequenceNumberInternal(rmDTIdentifier, renewDate,
++          latestSequenceNumber);
+     } catch (Exception e) {
+       notifyStoreOperationFailed(e);
+     }
+@@ -547,9 +551,9 @@ public synchronized void updateRMDelegationToken(
+    * Derived classes must implement this method to update the state of
+    * RMDelegationToken and sequence number
+    */
+-  protected abstract void updateRMDelegationTokenState(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+-      throws Exception;
++  protected abstract void updateRMDelegationTokenAndSequenceNumberInternal(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) throws Exception;
+ 
+   /**
+    * RMDTSecretManager call this to store the state of a master key
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+index 749dc37..21ba4bc 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+@@ -716,11 +716,12 @@ public synchronized void removeApplicationStateInternal(
+   }
+ 
+   @Override
+-  protected synchronized void storeRMDelegationTokenState(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+-      throws Exception {
++  protected synchronized void storeRMDelegationTokenAndSequenceNumberState(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) throws Exception {
+     ArrayList<Op> opList = new ArrayList<Op>();
+-    addStoreOrUpdateOps(opList, rmDTIdentifier, renewDate, false);
++    addStoreOrUpdateOps(
++        opList, rmDTIdentifier, renewDate, latestSequenceNumber, false);
+     doMultiWithRetries(opList);
+   }
+ 
+@@ -744,27 +745,29 @@ protected synchronized void removeRMDelegationTokenState(
+   }
+ 
+   @Override
+-  protected synchronized void updateRMDelegationTokenState(
+-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+-      throws Exception {
++  protected void updateRMDelegationTokenAndSequenceNumberInternal(
++      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
++      int latestSequenceNumber) throws Exception {
+     ArrayList<Op> opList = new ArrayList<Op>();
+     String nodeRemovePath =
+         getNodePath(delegationTokensRootPath, DELEGATION_TOKEN_PREFIX
+             + rmDTIdentifier.getSequenceNumber());
+     if (existsWithRetries(nodeRemovePath, false) == null) {
+       // in case znode doesn't exist
+-      addStoreOrUpdateOps(opList, rmDTIdentifier, renewDate, false);
++      addStoreOrUpdateOps(
++          opList, rmDTIdentifier, renewDate, latestSequenceNumber, false);
+       LOG.debug("Attempted to update a non-existing znode " + nodeRemovePath);
+     } else {
+       // in case znode exists
+-      addStoreOrUpdateOps(opList, rmDTIdentifier, renewDate, true);
++      addStoreOrUpdateOps(
++          opList, rmDTIdentifier, renewDate, latestSequenceNumber, true);
+     }
+     doMultiWithRetries(opList);
+   }
+ 
+   private void addStoreOrUpdateOps(ArrayList<Op> opList,
+       RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
+-      boolean isUpdate) throws Exception {
++      int latestSequenceNumber, boolean isUpdate) throws Exception {
+     // store RM delegation token
+     String nodeCreatePath =
+         getNodePath(delegationTokensRootPath, DELEGATION_TOKEN_PREFIX
+@@ -787,15 +790,16 @@ private void addStoreOrUpdateOps(ArrayList<Op> opList,
+       } else {
+         opList.add(Op.create(nodeCreatePath, tokenOs.toByteArray(), zkAcl,
+             CreateMode.PERSISTENT));
+-        // Update Sequence number only while storing DT
+-        seqOut.writeInt(rmDTIdentifier.getSequenceNumber());
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug((isUpdate ? "Storing " : "Updating ") +
+-                    dtSequenceNumberPath + ". SequenceNumber: "
+-                    + rmDTIdentifier.getSequenceNumber());
+-        }
+-        opList.add(Op.setData(dtSequenceNumberPath, seqOs.toByteArray(), -1));
+       }
++
++
++     seqOut.writeInt(latestSequenceNumber);
++     if (LOG.isDebugEnabled()) {
++        LOG.debug((isUpdate ? "Storing " : "Updating ") + dtSequenceNumberPath +
++            ". SequenceNumber: " + latestSequenceNumber);
++      }
++
++     opList.add(Op.setData(dtSequenceNumberPath, seqOs.toByteArray(), -1));
+     } finally {
+       tokenOs.close();
+       seqOs.close();
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/RMDelegationTokenSecretManager.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/RMDelegationTokenSecretManager.java
+index 83defc5..90706ff 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/RMDelegationTokenSecretManager.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/RMDelegationTokenSecretManager.java
+@@ -29,8 +29,10 @@
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.classification.InterfaceAudience.Private;
+ import org.apache.hadoop.classification.InterfaceStability;
++import org.apache.hadoop.security.token.SecretManager.InvalidToken;
+ import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSecretManager;
+ import org.apache.hadoop.security.token.delegation.DelegationKey;
++import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSecretManager.DelegationTokenInformation;
+ import org.apache.hadoop.util.ExitUtil;
+ import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
+ import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+@@ -107,7 +109,8 @@ protected void storeNewToken(RMDelegationTokenIdentifier identifier,
+     try {
+       LOG.info("storing RMDelegation token with sequence number: "
+           + identifier.getSequenceNumber());
+-      rmContext.getStateStore().storeRMDelegationToken(identifier, renewDate);
++      rmContext.getStateStore().storeRMDelegationTokenAndSequenceNumber(
++        identifier, renewDate, identifier.getSequenceNumber());
+     } catch (Exception e) {
+       LOG.error("Error in storing RMDelegationToken with sequence number: "
+           + identifier.getSequenceNumber());
+@@ -121,10 +124,11 @@ protected void updateStoredToken(RMDelegationTokenIdentifier id,
+     try {
+       LOG.info("updating RMDelegation token with sequence number: "
+           + id.getSequenceNumber());
+-      rmContext.getStateStore().updateRMDelegationToken(id, renewDate);
++      rmContext.getStateStore().updateRMDelegationTokenAndSequenceNumber(id,
++        renewDate, id.getSequenceNumber());
+     } catch (Exception e) {
+-      LOG.error("Error in updating persisted RMDelegationToken" +
+-                " with sequence number: " + id.getSequenceNumber());
++      LOG.error("Error in updating persisted RMDelegationToken with sequence number: "
++            + id.getSequenceNumber());
+       ExitUtil.terminate(1, e);
+     }
+   }
+@@ -135,7 +139,8 @@ protected void removeStoredToken(RMDelegationTokenIdentifier ident)
+     try {
+       LOG.info("removing RMDelegation token with sequence number: "
+           + ident.getSequenceNumber());
+-      rmContext.getStateStore().removeRMDelegationToken(ident);
++      rmContext.getStateStore().removeRMDelegationToken(ident,
++        delegationTokenSequenceNumber);
+     } catch (Exception e) {
+       LOG.error("Error in removing RMDelegationToken with sequence number: "
+           + ident.getSequenceNumber());
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+index 3710525..efad5bc 100644
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreTestBase.java
+@@ -415,15 +415,15 @@ public void testRMDTSecretManagerStateStore(
+     RMDelegationTokenIdentifier dtId1 =
+         new RMDelegationTokenIdentifier(new Text("owner1"),
+           new Text("renewer1"), new Text("realuser1"));
+-    
+-    int sequenceNumber = 1111;
+-    dtId1.setSequenceNumber(sequenceNumber);
+     Long renewDate1 = new Long(System.currentTimeMillis());
+-    store.storeRMDelegationToken(dtId1, renewDate1);
++    int sequenceNumber = 1111;
++    store.storeRMDelegationTokenAndSequenceNumber(dtId1, renewDate1,
++      sequenceNumber);
+     modifyRMDelegationTokenState();
+     Map<RMDelegationTokenIdentifier, Long> token1 =
+         new HashMap<RMDelegationTokenIdentifier, Long>();
+     token1.put(dtId1, renewDate1);
++
+     // store delegation key;
+     DelegationKey key = new DelegationKey(1234, 4321 , "keyBytes".getBytes());
+     HashSet<DelegationKey> keySet = new HashSet<DelegationKey>();
+@@ -439,7 +439,9 @@ public void testRMDTSecretManagerStateStore(
+ 
+     // update RM delegation token;
+     renewDate1 = new Long(System.currentTimeMillis());
+-    store.updateRMDelegationToken(dtId1, renewDate1);
++    ++sequenceNumber;
++    store.updateRMDelegationTokenAndSequenceNumber(
++        dtId1, renewDate1, sequenceNumber);
+     token1.put(dtId1, renewDate1);
+ 
+     RMDTSecretManagerState updateSecretManagerState =
+@@ -460,7 +462,7 @@ public void testRMDTSecretManagerStateStore(
+         noKeySecretManagerState.getDTSequenceNumber());
+ 
+     // check to delete delegationToken
+-    store.removeRMDelegationToken(dtId1);
++    store.removeRMDelegationToken(dtId1, sequenceNumber);
+     RMDTSecretManagerState noKeyAndTokenSecretManagerState =
+         store.loadState().getRMDTSecretManagerState();
+     token1.clear();
+-- 
+1.7.9.5
+
