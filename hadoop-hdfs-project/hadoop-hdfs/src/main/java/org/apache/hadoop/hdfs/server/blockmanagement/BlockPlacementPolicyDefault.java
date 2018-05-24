@@ -29,6 +29,7 @@ import org.apache.hadoop.hdfs.protocol.BlockStoragePolicy;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.StorageType;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+import org.apache.hadoop.hdfs.server.protocol.BlockCommand;
 import org.apache.hadoop.hdfs.server.namenode.FSClusterStats;
 import org.apache.hadoop.net.NetworkTopology;
 import org.apache.hadoop.net.Node;
@@ -111,6 +112,9 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
                                     long blocksize,
                                     final BlockStoragePolicy storagePolicy,
                                     EnumSet<AddBlockFlag> flags) {
+    if (blocksize == BlockCommand.NO_ACK) {
+        return DatanodeStorageInfo.EMPTY_ARRAY;
+    }
     return chooseTarget(numOfReplicas, writer, chosenNodes, returnChosenNodes,
         excludedNodes, blocksize, storagePolicy, flags);
   }

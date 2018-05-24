@@ -2,3 +2,6 @@ NPE is thrown when log level changed in BlockPlacementPolicyDefault#chooseRandom
 * https://issues.apache.org/jira/browse/HDFS-11827
 * hadoop-hdfs-2.6.0-cdh5.8.0.jar
 
+ReplicationMonitor thread could stuck for long time due to the race between replication and delete of same file in a large cluster.
+* https://issues.apache.org/jira/browse/HDFS-10453
+* hadoop-hdfs-2.6.0-cdh5.8.0.jar

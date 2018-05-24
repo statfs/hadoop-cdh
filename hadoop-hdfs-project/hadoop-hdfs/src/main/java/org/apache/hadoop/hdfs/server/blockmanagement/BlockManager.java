@@ -1471,6 +1471,10 @@ public class BlockManager implements BlockStatsMXBean {
       for(ReplicationWork rw : work){
         final DatanodeStorageInfo[] targets = rw.targets;
         if(targets == null || targets.length == 0){
+          if (rw.block.getNumBytes() == BlockCommand.NO_ACK) {
+            // remove from neededReconstruction while block has deleted. 
+            neededReplications.remove(rw.block, rw.priority);
+          }
           rw.targets = null;
           continue;
         }
