@@ -1,0 +1,4 @@
+NPE is thrown when log level changed in BlockPlacementPolicyDefault#chooseRandom() method
+* https://issues.apache.org/jira/browse/HDFS-11827
+* hadoop-hdfs-2.6.0-cdh5.8.0.jar
+
